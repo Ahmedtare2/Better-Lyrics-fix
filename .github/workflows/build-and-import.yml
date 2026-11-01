@@ -1,1 +1,376 @@
+name: Build Better Lyrics APK
 
+# Single self-contained workflow: sets up the toolchain, gets the AI models
+# (from your ZIP URL and/or pinned Hugging Face downloads), verifies them,
+# builds ONE installable APK and uploads it.
+
+on:
+  push:
+    branches: ["**"]
+    paths-ignore: ["**/*.md", "docs/**"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      model_zip_url:
+        description: "Optional HTTPS URL of a models ZIP (aligner-ar/, aligner-en/, htdemucs/ or ctc_*.onnx layout). Anything missing is downloaded automatically."
+        required: false
+        type: string
+      run_checks:
+        description: "Run unit tests + lint before building (failures never block the APK)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MODEL_DIR: app/src/main/assets/models
+  # Pinned model sources (immutable Hugging Face commits + SHA-256)
+  AR_REPO: onnx-community/wav2vec2-base-arabic-without-reused-en-token-ids-v1-ONNX
+  AR_REV: 908b2bead4fe5c3ea5d5e31be904129fda068f74
+  AR_SHA: 209d73e012442c76b68a1df998e758876cda48c621bea28dae7e88c252d1773c
+  EN_REPO: onnx-community/wav2vec2-base-960h-ONNX
+  EN_REV: 729c1a6730fb549c20a1c73a3d3f96f11020225e
+  EN_SHA: 1d9a366c27b2966625cd5035ac3db8847c53bba617169912bb251b42975a3a22
+  DEMUCS_REPO: StemSplitio/htdemucs-onnx
+  DEMUCS_REV: d54ed9eb60e258ea82131c6ee14578628816456a
+  DEMUCS_SHA: d05c269d0178d2a72ad484b10b11dd370193fc923201c3b27a99f848745db70a
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      # ───────────── Source + toolchain ─────────────
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        with:
+          # The default ("tools platform-tools") fails: the legacy 'tools' package no longer exists.
+          packages: ""
+
+      - name: Install Android SDK components
+        run: sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle (with cache)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Locate project and prepare Gradle wrapper
+        run: |
+          set -euo pipefail
+          echo "=== Repository top level ==="; ls -la
+          find_settings() {
+            find . -maxdepth 3 \( -name settings.gradle.kts -o -name settings.gradle \) \
+              -not -path './.git/*' | head -n1
+          }
+          settings="$(find_settings)"
+
+          # The repo may only contain the project as a .zip (uploaded without extracting): unpack it.
+          if [[ -z "$settings" ]]; then
+            for z in ./*.zip; do
+              [[ -f "$z" ]] || continue
+              if unzip -l "$z" | grep -qE '[ /]settings\.gradle(\.kts)?$'; then
+                echo "Extracting project from $z"
+                mkdir -p _src
+                unzip -q -o "$z" -d _src
+                break
+              fi
+            done
+            settings="$(find_settings)"
+          fi
+
+          if [[ -z "$settings" ]]; then
+            echo "::error::No settings.gradle(.kts) found. The project files were not uploaded to this repo. Tree:"
+            find . -maxdepth 3 -not -path './.git/*' | sort | head -80
+            exit 1
+          fi
+          proj="$(cd "$(dirname "$settings")" && pwd)"
+          echo "Project directory: $proj"
+          echo "PROJECT_DIR=$proj" >> "$GITHUB_ENV"
+          cd "$proj"
+          test -d app || { echo "::error::No app/ module in $proj"; exit 1; }
+
+          # Website uploads lose the executable bit, and may skip gradlew / the wrapper jar.
+          if [[ ! -f gradlew || ! -s gradle/wrapper/gradle-wrapper.jar ]]; then
+            echo "Wrapper missing - regenerating with Gradle 8.7"
+            gradle wrapper --gradle-version 8.7
+          fi
+          chmod +x ./gradlew
+          ./gradlew --version
+
+      # ───────────── Models ─────────────
+      - name: Restore model cache
+        id: mcache
+        if: ${{ inputs.model_zip_url == '' }}
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.PROJECT_DIR }}/app/src/main/assets/models
+          key: models-${{ hashFiles('.github/workflows/build-and-import.yml') }}
+
+      - name: Import models from ZIP (optional)
+        if: ${{ inputs.model_zip_url != '' }}
+        env:
+          ZIP_URL: ${{ inputs.model_zip_url }}
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          mkdir -p "$MODEL_DIR"
+          tmp="$(mktemp -d)"
+          curl -L --fail --retry 3 --retry-delay 5 -o "$tmp/models.zip" "$ZIP_URL"
+          unzip -q "$tmp/models.zip" -d "$tmp/x"
+
+          # If the ZIP has a single top-level folder, step into it.
+          root="$tmp/x"
+          if [[ $(find "$root" -mindepth 1 -maxdepth 1 | wc -l) -eq 1 && -d "$(find "$root" -mindepth 1 -maxdepth 1)" ]]; then
+            root="$(find "$root" -mindepth 1 -maxdepth 1)"
+          fi
+          echo "=== ZIP contents ==="; (cd "$root" && find . -type f | sort)
+
+          # CI layout: ctc_ar.onnx, vocab_ar.json, meta_ar.json ... (copied as-is)
+          for f in ctc_ar.onnx ctc_en.onnx vocab_ar.json vocab_en.json meta_ar.json meta_en.json htdemucs_fp16.onnx; do
+            if [[ -f "$root/$f" ]]; then cp "$root/$f" "$MODEL_DIR/$f"; fi
+          done
+
+          # Phone layout: aligner-xx/{model.int8.onnx|model.onnx, vocab.json, meta.json}
+          for lang in ar en; do
+            d="$root/aligner-$lang"
+            [[ -d "$d" ]] || continue
+            if   [[ -f "$d/model.int8.onnx" ]]; then cp "$d/model.int8.onnx" "$MODEL_DIR/ctc_$lang.onnx"
+            elif [[ -f "$d/model.onnx"      ]]; then cp "$d/model.onnx"      "$MODEL_DIR/ctc_$lang.onnx"; fi
+            [[ -f "$d/vocab.json" ]] && cp "$d/vocab.json" "$MODEL_DIR/vocab_$lang.json"
+            [[ -f "$d/meta.json"  ]] && cp "$d/meta.json"  "$MODEL_DIR/meta_$lang.json"
+          done
+          if   [[ -f "$root/htdemucs/model.onnx"      ]]; then cp "$root/htdemucs/model.onnx"      "$MODEL_DIR/htdemucs_fp16.onnx"
+          elif [[ -f "$root/htdemucs/htdemucs_fp16.onnx" ]]; then cp "$root/htdemucs/htdemucs_fp16.onnx" "$MODEL_DIR/htdemucs_fp16.onnx"; fi
+
+          echo "=== Imported ==="; ls -la "$MODEL_DIR"
+          rm -rf "$tmp"
+
+      - name: Download any missing models (pinned and checksum-verified)
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          mkdir -p "$MODEL_DIR"
+
+          fetch() {  # fetch <file> <url> <sha256|-> <min_bytes>
+            local target="$MODEL_DIR/$1" url="$2" sha="$3" min="$4"
+            if [[ -s "$target" ]]; then echo "have $1 - skipping"; return 0; fi
+            echo "Downloading $1"
+            curl --fail --location --retry 4 --retry-all-errors --connect-timeout 30 \
+                 --max-time 1800 --output "$target.part" "$url"
+            if [[ "$sha" != "-" ]]; then
+              echo "$sha  $target.part" | sha256sum --check --status
+            fi
+            if [[ "$(stat -c '%s' "$target.part")" -lt "$min" ]]; then
+              echo "::error::$1 is smaller than expected ($min bytes)"; rm -f "$target.part"; exit 1
+            fi
+            mv "$target.part" "$target"
+          }
+          hf() { echo "https://huggingface.co/$1/resolve/$2/$3"; }
+
+          # Arabic model: download FP32 source, then quantize (UINT8 MatMul)
+          if [[ ! -s "$MODEL_DIR/ctc_ar.onnx" ]]; then
+            src="ctc_ar.source.onnx"
+            fetch "$src" "$(hf "$AR_REPO" "$AR_REV" onnx/model.onnx)" "$AR_SHA" 300000000
+            python3 -m pip install --disable-pip-version-check --break-system-packages \
+              "onnx==1.16.2" "onnxruntime==1.19.2"
+            python3 - "$MODEL_DIR/$src" "$MODEL_DIR/ctc_ar.onnx" <<'PY'
+          import os, sys
+          from onnxruntime.quantization import QuantType, quantize_dynamic
+
+          source, dest = sys.argv[1:]
+          part = dest + ".part"
+          try:
+              quantize_dynamic(source, part, weight_type=QuantType.QUInt8,
+                               op_types_to_quantize=["MatMul"])
+              if not os.path.isfile(part) or os.path.getsize(part) < 50_000_000:
+                  raise RuntimeError("Quantized Arabic model is missing or too small")
+              os.replace(part, dest)
+          finally:
+              if os.path.exists(part):
+                  os.remove(part)
+              os.remove(source)
+          PY
+          fi
+          # Small optional files: the upstream repos may not publish meta.json, so try the
+          # download once and otherwise generate it from the vocab (what the app reads).
+          cat > "$RUNNER_TEMP/mkmeta.py" <<'PY'
+          import json, sys
+          vocab = json.load(open(sys.argv[1], encoding="utf-8"))
+          if isinstance(vocab.get("vocab"), dict):
+              vocab = vocab["vocab"]
+          blank = next((vocab[t] for t in ("<pad>", "[PAD]") if t in vocab), 0)
+          delim = next((t for t in ("|", " ") if t in vocab), "|")
+          json.dump({"blank_id": blank, "word_delimiter_token": delim,
+                     "generated_by": "build workflow"}, open(sys.argv[2], "w"))
+          print(f"generated {sys.argv[2]}: blank_id={blank} delimiter={delim!r}")
+          PY
+          optional() {  # <file> <url>
+            local f="$MODEL_DIR/$1"
+            [[ -s "$f" ]] && return 0
+            if curl --fail --silent --location --connect-timeout 30 --max-time 120 -o "$f.part" "$2"; then
+              mv "$f.part" "$f"
+            else
+              rm -f "$f.part"; return 1
+            fi
+          }
+          ensure_meta() {  # <lang> <repo> <rev>
+            optional "meta_$1.json" "$(hf "$2" "$3" meta.json)" && return 0
+            echo "No upstream meta.json for $1 - generating from vocab"
+            python3 "$RUNNER_TEMP/mkmeta.py" "$MODEL_DIR/vocab_$1.json" "$MODEL_DIR/meta_$1.json"
+          }
+
+          fetch vocab_ar.json "$(hf "$AR_REPO" "$AR_REV" vocab.json)" - 16
+          ensure_meta ar "$AR_REPO" "$AR_REV"
+
+          # English model (pre-quantized)
+          fetch ctc_en.onnx "$(hf "$EN_REPO" "$EN_REV" onnx/model_quantized.onnx)" "$EN_SHA" 50000000
+          if ! optional vocab_en.json "$(hf "$EN_REPO" "$EN_REV" vocab.json)"; then
+            echo "::warning::No vocab.json upstream for English - writing the standard wav2vec2-base-960h vocab"
+            echo '{"<pad>":0,"<s>":1,"</s>":2,"<unk>":3,"|":4,"E":5,"T":6,"A":7,"O":8,"N":9,"I":10,"H":11,"S":12,"R":13,"D":14,"L":15,"U":16,"M":17,"W":18,"C":19,"F":20,"G":21,"Y":22,"P":23,"B":24,"V":25,"K":26,"'"'"'":27,"X":28,"J":29,"Q":30,"Z":31}' \
+              > "$MODEL_DIR/vocab_en.json"
+          fi
+          ensure_meta en "$EN_REPO" "$EN_REV"
+
+          # HTDemucs (FP16)
+          fetch htdemucs_fp16.onnx "$(hf "$DEMUCS_REPO" "$DEMUCS_REV" htdemucs_fp16weights.onnx)" "$DEMUCS_SHA" 100000000
+
+      - name: Verify model assets
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR/$MODEL_DIR"
+
+          check_model() {  # <file> <min_bytes>
+            [[ -s "$1" ]] || { echo "::error::Missing model $1"; exit 1; }
+            size=$(stat -c '%s' "$1")
+            (( size >= $2 )) || { echo "::error::$1 is incomplete ($size < $2 bytes)"; exit 1; }
+            [[ "$(od -An -N1 -tx1 "$1" | tr -d '[:space:]')" != "3c" ]] \
+              || { echo "::error::$1 looks like an HTML error page"; exit 1; }
+          }
+          check_model ctc_ar.onnx        50000000
+          check_model ctc_en.onnx        50000000
+          check_model htdemucs_fp16.onnx 100000000
+
+          python3 - vocab_ar.json vocab_en.json meta_ar.json meta_en.json <<'PY'
+          import json, sys
+          for name in sys.argv[1:]:
+              with open(name, encoding="utf-8") as f:
+                  data = json.load(f)
+              if not isinstance(data, dict) or not data:
+                  raise SystemExit(f"{name} must be a non-empty JSON object")
+              if name.startswith("meta") and not ({"blank_id", "pad_token_id"} & data.keys()):
+                  print(f"::warning::{name} has no blank_id/pad_token_id")
+              print(f"OK {name} ({len(data)} keys)")
+          PY
+
+          # Provenance manifests
+          {
+            echo "arabic.repository=$AR_REPO"
+            echo "arabic.revision=$AR_REV"
+            echo "english.repository=$EN_REPO"
+            echo "english.revision=$EN_REV"
+            echo "demucs.repository=$DEMUCS_REPO"
+            echo "demucs.revision=$DEMUCS_REV"
+            echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > model-assets.properties
+          sha256sum ctc_ar.onnx ctc_en.onnx htdemucs_fp16.onnx \
+                    vocab_ar.json vocab_en.json meta_ar.json meta_en.json > model-assets.sha256
+          du -h ./*.onnx ./*.json
+
+      - name: Save model cache (even if the build fails later)
+        if: ${{ inputs.model_zip_url == '' && steps.mcache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.PROJECT_DIR }}/app/src/main/assets/models
+          key: models-${{ hashFiles('.github/workflows/build-and-import.yml') }}
+
+      # ───────────── Signing (optional) ─────────────
+      - name: Configure signing
+        id: signing
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [[ -n "$KS_B64" && -n "$KS_PASS" && -n "$KEY_ALIAS" && -n "$KEY_PASS" ]]; then
+            ks="$RUNNER_TEMP/release.keystore"
+            printf '%s' "$KS_B64" | base64 --decode > "$ks"
+            chmod 600 "$ks"
+            {
+              echo "ANDROID_KEYSTORE_PATH=$ks"
+              echo "ANDROID_KEYSTORE_PASSWORD=$KS_PASS"
+              echo "ANDROID_KEY_ALIAS=$KEY_ALIAS"
+              echo "ANDROID_KEY_PASSWORD=$KEY_PASS"
+            } >> "$GITHUB_ENV"
+            echo "mode=release" >> "$GITHUB_OUTPUT"
+            echo "Signing secrets found: building a signed RELEASE APK."
+          else
+            echo "mode=debug" >> "$GITHUB_OUTPUT"
+            echo "No signing secrets: building an installable DEBUG APK."
+          fi
+
+      # ───────────── Checks (never block the APK) ─────────────
+      - name: Unit tests + lint
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_checks }}
+        continue-on-error: true
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: ./gradlew :app:testDebugUnitTest :app:lintDebug --stacktrace
+
+      # ───────────── Build ONE APK ─────────────
+      - name: Build APK
+        env:
+          MODE: ${{ steps.signing.outputs.mode }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          if [[ "$MODE" == "release" ]]; then task=assembleRelease; else task=assembleDebug; fi
+          ./gradlew ":app:$task" --stacktrace 2>&1 | tee "$RUNNER_TEMP/gradle-build.log"
+
+          apk="$(find "app/build/outputs/apk/$MODE" -name '*.apk' | head -n1)"
+          [[ -n "$apk" ]] || { echo "::error::No APK produced"; exit 1; }
+          mkdir -p dist
+          cp "$apk" "dist/BetterLyrics-$MODE-${{ github.run_number }}.apk"
+          ls -lh dist
+
+      - name: Show build errors on the run page
+        if: ${{ failure() }}
+        run: |
+          log="$RUNNER_TEMP/gradle-build.log"
+          [[ -f "$log" ]] || exit 0
+          grep -E '^e: ' "$log" | sed -E 's#^e: file://##; s#^.*/_src/##' | awk '!seen[$0]++' | head -60 > "$RUNNER_TEMP/errs.txt" || true
+          grep -E -A6 'What went wrong' "$log" | head -20 > "$RUNNER_TEMP/wrong.txt" || true
+          {
+            echo "### Build failed"
+            if [[ -s "$RUNNER_TEMP/errs.txt" ]]; then
+              echo "Kotlin compile errors (first 60):"; echo '```'; cat "$RUNNER_TEMP/errs.txt"; echo '```'
+            fi
+            if [[ -s "$RUNNER_TEMP/wrong.txt" ]]; then
+              echo "Gradle said:"; echo '```'; cat "$RUNNER_TEMP/wrong.txt"; echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          head -15 "$RUNNER_TEMP/errs.txt" | while IFS= read -r l; do echo "::error::$l"; done
+
+      - name: Upload APK
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: BetterLyrics-${{ steps.signing.outputs.mode }}-${{ github.run_number }}
+          path: ${{ env.PROJECT_DIR }}/dist/*.apk
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
