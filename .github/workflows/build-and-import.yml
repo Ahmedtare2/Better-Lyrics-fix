@@ -15,6 +15,11 @@ on:
         description: "Optional HTTPS URL of a models ZIP (aligner-ar/, aligner-en/, htdemucs/ or ctc_*.onnx layout). Anything missing is downloaded automatically."
         required: false
         type: string
+      arabic_fp32:
+        description: "Keep the Arabic CTC model in full FP32 precision (no INT8 quantization): usually slightly better timing, but about 280 MB larger and needs more RAM on the phone"
+        required: false
+        default: false
+        type: boolean
       run_checks:
         description: "Run unit tests + lint before building (failures never block the APK)"
         required: false
@@ -120,7 +125,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.PROJECT_DIR }}/app/src/main/assets/models
-          key: models-${{ hashFiles('.github/workflows/build-and-import.yml') }}
+          key: models-${{ inputs.arabic_fp32 && 'fp32' || 'int8' }}-${{ hashFiles('.github/workflows/build-and-import.yml') }}
 
       - name: Import models from ZIP (optional)
         if: ${{ inputs.model_zip_url != '' }}
@@ -162,6 +167,8 @@ jobs:
           rm -rf "$tmp"
 
       - name: Download any missing models (pinned and checksum-verified)
+        env:
+          ARABIC_FP32: ${{ inputs.arabic_fp32 }}
         run: |
           set -euo pipefail
           cd "$PROJECT_DIR"
@@ -187,6 +194,10 @@ jobs:
           if [[ ! -s "$MODEL_DIR/ctc_ar.onnx" ]]; then
             src="ctc_ar.source.onnx"
             fetch "$src" "$(hf "$AR_REPO" "$AR_REV" onnx/model.onnx)" "$AR_SHA" 300000000
+            if [[ "${ARABIC_FP32:-}" == "true" ]]; then
+              echo "Keeping the Arabic model in FP32 (checksum-verified, no quantization)"
+              mv "$MODEL_DIR/$src" "$MODEL_DIR/ctc_ar.onnx"
+            else
             python3 -m pip install --disable-pip-version-check --break-system-packages \
               "onnx==1.16.2" "onnxruntime==1.19.2"
             python3 - "$MODEL_DIR/$src" "$MODEL_DIR/ctc_ar.onnx" <<'PY'
@@ -206,6 +217,7 @@ jobs:
                   os.remove(part)
               os.remove(source)
           PY
+            fi
           fi
           # Small optional files: the upstream repos may not publish meta.json, so try the
           # download once and otherwise generate it from the vocab (what the app reads).
@@ -297,7 +309,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ env.PROJECT_DIR }}/app/src/main/assets/models
-          key: models-${{ hashFiles('.github/workflows/build-and-import.yml') }}
+          key: models-${{ inputs.arabic_fp32 && 'fp32' || 'int8' }}-${{ hashFiles('.github/workflows/build-and-import.yml') }}
 
       # ───────────── Signing (optional) ─────────────
       - name: Configure signing
