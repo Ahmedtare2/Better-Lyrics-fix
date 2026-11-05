@@ -27,7 +27,7 @@ on:
         type: boolean
 
 permissions:
-  contents: read
+  contents: write   # lets the build publish the APK as a GitHub Release (does not use the Actions artifact quota)
 
 concurrency:
   group: android-${{ github.workflow }}-${{ github.ref }}
@@ -378,11 +378,38 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           head -15 "$RUNNER_TEMP/errs.txt" | while IFS= read -r l; do echo "::error::$l"; done
 
-      - name: Upload APK
+      # The APK is ~400 MB; the free Actions artifact quota (500 MB) fills up after one or two runs and then
+      # "Failed to CreateArtifact: Artifact storage quota has been hit" fails the whole run. So: keep the artifact
+      # for ONE day, never let a quota error fail the run, and publish the APK as a GitHub Release asset as well.
+      - name: Upload APK (workflow artifact, 1 day)
+        continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: BetterLyrics-${{ steps.signing.outputs.mode }}-${{ github.run_number }}
           path: ${{ env.PROJECT_DIR }}/dist/*.apk
           if-no-files-found: error
           compression-level: 0
-          retention-days: 30
+          retention-days: 1
+
+      - name: Publish APK to a GitHub Release (keeps the latest 3 builds)
+        if: ${{ github.event_name != 'pull_request' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ steps.signing.outputs.mode }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          tag="build-${{ github.run_number }}"
+          gh release create "$tag" dist/*.apk \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "Better Lyrics build ${{ github.run_number }} ($MODE)" \
+            --notes "Automated $MODE build of commit ${{ github.sha }}. Download the .apk below and install it." \
+            --prerelease
+          # keep only the newest 3 automated releases so the repository never fills up
+          gh release list --repo "${{ github.repository }}" --limit 100 --json tagName --jq '.[].tagName' \
+            | grep '^build-' | sort -t- -k2 -n -r | tail -n +4 \
+            | xargs -r -I{} gh release delete {} --repo "${{ github.repository }}" --cleanup-tag --yes
+          echo "### APK published" >> "$GITHUB_STEP_SUMMARY"
+          echo "Open the repository's **Releases** page and download the APK from release \`$tag\`." >> "$GITHUB_STEP_SUMMARY"
